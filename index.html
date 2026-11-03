@@ -1,45 +1,206 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <style>
-        body { padding: 0; margin: 0; }
-        html, body, #map { height: 100%; width: 100%; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Laastu phone position</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body, #map { height: 100%; width: 100%; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #bar {
+    position: absolute; z-index: 1000; left: 8px; right: 8px; bottom: 8px;
+    display: flex; gap: 8px; align-items: center;
+    background: #fff; color: #1b1f24; border: 1px solid #c9cfd6; border-radius: 8px;
+    padding: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.25);
+  }
+  #status { flex: 1; font-size: 14px; line-height: 1.3; min-width: 0; }
+  button {
+    font: inherit; font-size: 15px; padding: 10px 12px; border-radius: 6px;
+    border: 1px solid #1f60c4; background: #1f60c4; color: #fff;
+  }
+  button.secondary { background: #fff; color: #1f60c4; }
+  button.on { background: #b3261e; border-color: #b3261e; }
+  button:focus-visible { outline: 3px solid #f5a623; outline-offset: 2px; }
+</style>
 </head>
 <body>
-    <div id="map"></div>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script>
-        var map = L.map('map').setView([0, 0], 2);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+<div id="map"></div>
+<div id="bar">
+  <div id="status">Waiting for GPS…</div>
+  <button id="center" class="secondary" type="button">Center on me</button>
+  <button id="share" type="button">Share to Grafana</button>
+</div>
 
-        // 1. Paste your exported GeoJSON inside this object
-        var myArea = {
-          "type": "FeatureCollection",
-          "features": [
-              // {"type": "Feature", ... }
-          ]
-        };
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/* ---------- Settings ---------- */
+// Firebase Realtime Database URL, ending in /phone.json
+// Optional: add ?auth=YOUR_DATABASE_SECRET if you lock the rules down.
+var DB_URL = "https://YOURPROJECT-default-rtdb.europe-west1.firebasedatabase.app/phone.json";
+var DEVICE = "kaido-phone";
+var SEND_EVERY_MS = 5000;   // minimum gap between uploads
 
-        // Draw the GeoJSON and zoom to it
-        var areaLayer = L.geoJSON(myArea).addTo(map);
-        if (myArea.features.length > 0) map.fitBounds(areaLayer.getBounds());
+// Field layers, the same GeoJSON files your Grafana geomap uses
+var GISTS = [
+  { url: "https://gist.githubusercontent.com/kkajakas/d28a243716975190f5f19f23ce35d47e/raw/293724ed58906b0df9dcc460772e4ded31e0dc5a/gistfile1.txt", color: "#37872D" },
+  { url: "https://gist.githubusercontent.com/kkajakas/759c3cdda043e6e3413511e7c35ef895/raw/3a5d90d10484a9dc39a83311f4f43d1acd70ed62/gistfile1.txt", color: "#8F3BB8" },
+  { url: "https://gist.githubusercontent.com/kkajakas/cd926ecf2a341094c0b308ba11cb8ebe/raw/3652202b82b758054d9c9ad5cc8de40c568fb8d3/gistfile1.txt", color: "#1F60C4" }
+];
 
-        // 2. Track Phone Location
-        var marker, circle;
-        if (navigator.geolocation) {
-            navigator.geolocation.watchPosition(function(pos) {
-                var lat = pos.coords.latitude;
-                var lng = pos.coords.longitude;
-                
-                if (marker) { map.removeLayer(marker); map.removeLayer(circle); }
-                
-                marker = L.marker([lat, lng]).addTo(map);
-                circle = L.circle([lat, lng], { radius: pos.coords.accuracy }).addTo(map);
-            }, function(err) { console.error(err); }, { enableHighAccuracy: true });
+/* ---------- Map ---------- */
+var map = L.map("map").setView([58.8695, 25.5655], 16);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: "&copy; OpenStreetMap contributors"
+}).addTo(map);
+
+var area = L.featureGroup().addTo(map);
+GISTS.forEach(function (g) {
+  fetch(g.url)
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      L.geoJSON(data, {
+        style: { color: g.color, weight: 1, opacity: 0.9 },
+        pointToLayer: function (f, ll) {
+          return L.circleMarker(ll, { radius: 3, color: g.color, weight: 1, fillOpacity: 0.7 });
         }
-    </script>
+      }).addTo(area);
+      if (!window.__fitted && area.getBounds().isValid()) {
+        map.fitBounds(area.getBounds());
+        window.__fitted = true;
+      }
+    })
+    .catch(function (e) { console.error("GeoJSON load failed", g.url, e); });
+});
+
+/* ---------- UI helpers ---------- */
+var statusEl = document.getElementById("status");
+var shareBtn = document.getElementById("share");
+var centerBtn = document.getElementById("center");
+function setStatus(t) { statusEl.textContent = t; }
+function clock() { return new Date().toLocaleTimeString(); }
+
+/* ---------- Wake lock (keeps the screen on while sharing) ---------- */
+var wakeLock = null;
+function requestWake() {
+  if (!("wakeLock" in navigator)) return;
+  navigator.wakeLock.request("screen")
+    .then(function (l) { wakeLock = l; })
+    .catch(function () {});
+}
+function releaseWake() {
+  if (wakeLock) { wakeLock.release().catch(function () {}); wakeLock = null; }
+}
+document.addEventListener("visibilitychange", function () {
+  if (document.visibilityState === "visible" && sharing) requestWake();
+});
+
+/* ---------- Send to Firebase ---------- */
+var sharing = false;
+var lastSent = 0;
+var lastSendInfo = "";
+
+function sendPosition(pos) {
+  var now = Date.now();
+  if (now - lastSent < SEND_EVERY_MS) return;
+  lastSent = now;
+
+  var c = pos.coords;
+  var body = {
+    device: DEVICE,
+    lat: c.latitude,
+    lon: c.longitude,
+    acc: Math.round(c.accuracy),
+    speed: c.speed != null ? c.speed : 0,
+    ts: pos.timestamp
+  };
+
+  // PUT overwrites the single "current position" record
+  fetch(DB_URL, { method: "PUT", body: JSON.stringify(body) })
+    .then(function (r) {
+      lastSendInfo = r.ok ? "sent " + clock() : "send failed (" + r.status + ")";
+      refreshStatus();
+    })
+    .catch(function (e) {
+      console.error(e);
+      lastSendInfo = "send failed (network)";
+      refreshStatus();
+    });
+}
+
+function clearRemote() {
+  // Removes the record so the marker disappears from Grafana
+  fetch(DB_URL, { method: "DELETE" }).catch(function () {});
+}
+
+/* ---------- Geolocation ---------- */
+var marker = null, circle = null, lastPos = null;
+
+function refreshStatus() {
+  if (!lastPos) return;
+  var t = "±" + Math.round(lastPos.coords.accuracy) + " m";
+  t += sharing ? " · " + (lastSendInfo || "sharing…") : " · not sharing";
+  setStatus(t);
+}
+
+function onPosition(pos) {
+  lastPos = pos;
+  var ll = [pos.coords.latitude, pos.coords.longitude];
+
+  if (!marker) {
+    marker = L.marker(ll).addTo(map);
+    circle = L.circle(ll, { radius: pos.coords.accuracy, color: "#b3261e", weight: 1 }).addTo(map);
+  } else {
+    marker.setLatLng(ll);
+    circle.setLatLng(ll).setRadius(pos.coords.accuracy);
+  }
+
+  if (sharing) sendPosition(pos);
+  refreshStatus();
+}
+
+function onError(err) {
+  var msg = {
+    1: "Location blocked. Allow location for this site in browser settings.",
+    2: "Position unavailable. Move to open sky.",
+    3: "GPS timed out. Retrying…"
+  }[err.code] || err.message;
+  setStatus(msg);
+}
+
+if (!("geolocation" in navigator)) {
+  setStatus("This browser has no geolocation.");
+} else {
+  navigator.geolocation.watchPosition(onPosition, onError, {
+    enableHighAccuracy: true,
+    maximumAge: 0,
+    timeout: 20000
+  });
+}
+
+/* ---------- Buttons ---------- */
+centerBtn.onclick = function () {
+  if (lastPos) map.setView([lastPos.coords.latitude, lastPos.coords.longitude], Math.max(map.getZoom(), 18));
+};
+
+shareBtn.onclick = function () {
+  sharing = !sharing;
+  if (sharing) {
+    shareBtn.textContent = "Stop sharing";
+    shareBtn.classList.add("on");
+    lastSent = 0;
+    lastSendInfo = "";
+    requestWake();
+    if (lastPos) sendPosition(lastPos);
+  } else {
+    shareBtn.textContent = "Share to Grafana";
+    shareBtn.classList.remove("on");
+    releaseWake();
+    clearRemote();
+  }
+  refreshStatus();
+};
+</script>
 </body>
 </html>
